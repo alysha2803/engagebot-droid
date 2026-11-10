@@ -1,9 +1,10 @@
 opencv-python>=4.9.0,<4.12
 mediapipe==0.10.9
-numpy>=1.24.0,<2
+numpy>=1.24.0
 httpx>=0.27.0
 python-dotenv>=1.0.0
 onnxruntime>=1.17.0
+ultralytics>=8.4.0
 # Pinned: mediapipe needs protobuf<4. Do NOT install the `insightface` or
 # `onnx` PyPI packages here -- both pull in protobuf>=6 and break
 # mediapipe.FaceMesh at runtime. See face_embedding.py for why.

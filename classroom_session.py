@@ -1,7 +1,8 @@
 """
-Phase 2: the real droid loop -- multi-face detection + tracking + recognition
-+ per-student engagement scoring, writing one SessionReport covering the
-WHOLE class (not a single pre-selected student like droid.py's prototype).
+Phase 2 + 3: the real droid loop -- multi-face detection + tracking +
+recognition + face cues + body-language cues + per-student engagement
+scoring, writing one SessionReport covering the WHOLE class (not a single
+pre-selected student like droid.py's prototype).
 
 Pipeline per frame:
     MediaPipe (detect all faces + landmarks)
@@ -9,13 +10,16 @@ Pipeline per frame:
            re-running recognition every single frame)
         -> FaceRecognizer, re-checked every RECOGNITION_INTERVAL_FRAMES
            per track (best-match against the class's enrolled students)
-        -> classify() from droid.py (pose/expression -> engagement score),
-           reused as-is -- the per-face cue extraction doesn't change just
-           because we now know whose face it is.
+        -> classify() from droid.py (pose/expression -> face score)
+    YOLOv8-Pose (detect all person boxes + keypoints)
+        -> matched to the same face tracks by bbox containment
+        -> classify_body() from body_cues.py (posture -> body score)
+    combine_scores() blends face + body into the final per-frame score.
 
 Each recognized student's scores are accumulated independently and flushed
 to the backend periodically as studentEngagements[], same report shape
-droid.py already produces (just with N students instead of 1).
+droid.py already produces (just with N students instead of 1, and a new
+postureDistribution field alongside poseDistribution/expressionDistribution).
 
 Usage:
     python classroom_session.py
@@ -30,6 +34,7 @@ import httpx
 import mediapipe as mp
 import numpy as np
 from dotenv import load_dotenv
+from ultralytics import YOLO
 
 load_dotenv()
 
@@ -41,6 +46,7 @@ from droid import (
 from face_embedding import FaceEmbedder, five_points_from_mediapipe
 from face_recognizer import FaceRecognizer
 from tracker import IoUTracker
+from body_cues import classify_body, combine_scores
 
 API_BASE               = os.getenv("API_BASE", "http://localhost:5000/api")
 CAMERA_SOURCE           = os.getenv("CAMERA_SOURCE", DEFAULT_CAMERA_SOURCE)
@@ -48,10 +54,13 @@ DEFAULT_EMAIL           = os.getenv("DROID_EMAIL", "")
 DEFAULT_PASSWORD        = os.getenv("DROID_PASSWORD", "")
 MAX_FACES               = int(os.getenv("MAX_FACES", "25"))
 RECOGNITION_INTERVAL    = int(os.getenv("RECOGNITION_INTERVAL_FRAMES", "10"))
+BODY_EVERY_N_FRAMES     = int(os.getenv("BODY_PROCESS_EVERY_N_FRAMES", "1"))
+FACE_WEIGHT             = float(os.getenv("FACE_WEIGHT", "0.6"))   # face vs body blend
 POST_INTERVAL           = 30     # seconds between live API updates
 TIMELINE_INTERVAL       = 5      # seconds between timeline sample points
 DROID_ID                = "classroom-prototype"
 DISTRACTED_CUTOFF       = 0.35
+MIN_FACE_CONTAINMENT    = 0.5    # fraction of the face bbox that must sit inside a YOLO person box to count as a match
 
 _COL_GREEN = (50, 205, 120)
 _COL_ORANGE = (0, 165, 255)
@@ -79,17 +88,20 @@ class StudentAggregator:
         self.all_distracted = 0
         self.pose_counts = {}
         self.expr_counts = {}
+        self.posture_counts = {}
         self.ear_samples = []
         self.mar_samples = []
         self.timeline = []
         self.last_tl_t = -TIMELINE_INTERVAL
 
-    def record(self, elapsed, score, pose, expr, ear, mar):
+    def record(self, elapsed, score, pose, expr, ear, mar, posture=None):
         self.all_scores.append(score)
         if score < DISTRACTED_CUTOFF:
             self.all_distracted += 1
         self.pose_counts[pose] = self.pose_counts.get(pose, 0) + 1
         self.expr_counts[expr] = self.expr_counts.get(expr, 0) + 1
+        if posture:
+            self.posture_counts[posture] = self.posture_counts.get(posture, 0) + 1
         self.ear_samples.append(ear)
         self.mar_samples.append(mar)
         if elapsed >= self.last_tl_t + TIMELINE_INTERVAL:
@@ -104,6 +116,7 @@ class StudentAggregator:
         focus_int = int(avg * 100)
         total_pose = sum(self.pose_counts.values()) or 1
         total_expr = sum(self.expr_counts.values()) or 1
+        total_posture = sum(self.posture_counts.values()) or 1
         return {
             "studentId": self.student_id,
             "studentName": self.name,
@@ -115,13 +128,14 @@ class StudentAggregator:
             "avgMAR": round(sum(self.mar_samples) / len(self.mar_samples), 3) if self.mar_samples else 0,
             "poseDistribution": {k: round(v / total_pose * 100) for k, v in self.pose_counts.items()},
             "expressionDistribution": {k: round(v / total_expr * 100) for k, v in self.expr_counts.items()},
+            "postureDistribution": {k: round(v / total_posture * 100) for k, v in self.posture_counts.items()},
             "timeline": list(self.timeline),
         }
 
 
 def setup(api):
     print("\n══════════════════════════════════════════")
-    print("   EngageBot Classroom Session (Phase 2)")
+    print("   EngageBot Classroom Session (Phase 2 + 3)")
     print("══════════════════════════════════════════\n")
 
     email = _ask("Teacher email", DEFAULT_EMAIL or None)
@@ -169,6 +183,43 @@ def _face_bbox(lm, w, h, pad=0.15):
     return int(x0 - pw), int(y0 - ph), int(x1 + pw), int(y1 + ph)
 
 
+def _containment(face_bbox, body_bbox):
+    """Fraction of `face_bbox` that lies inside `body_bbox`. A face box is
+    much smaller than the full-body YOLO box it belongs to, so IoU would be
+    tiny even for a correct match -- containment is the right metric here."""
+    fx0, fy0, fx1, fy1 = face_bbox
+    bx0, by0, bx1, by1 = body_bbox
+    ix0, iy0 = max(fx0, bx0), max(fy0, by0)
+    ix1, iy1 = min(fx1, bx1), min(fy1, by1)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = iw * ih
+    face_area = max(0, fx1 - fx0) * max(0, fy1 - fy0)
+    return inter / face_area if face_area > 0 else 0.0
+
+
+def _match_tracks_to_bodies(tracks, body_boxes):
+    """Greedy best-containment match between each face track and a YOLO
+    person box, so body keypoints get attributed to the right (already
+    face-recognized) student rather than guessed by detection order."""
+    pairs = []
+    for ti, track in enumerate(tracks):
+        for bi, bbox in enumerate(body_boxes):
+            c = _containment(track.bbox, bbox)
+            if c >= MIN_FACE_CONTAINMENT:
+                pairs.append((c, ti, bi))
+    pairs.sort(reverse=True)
+
+    assigned = {}
+    used_tracks, used_bodies = set(), set()
+    for c, ti, bi in pairs:
+        if ti in used_tracks or bi in used_bodies:
+            continue
+        assigned[ti] = bi
+        used_tracks.add(ti)
+        used_bodies.add(bi)
+    return assigned
+
+
 def main():
     api = EngageBotAPI()
     teacher_name, schedule = setup(api)
@@ -181,6 +232,7 @@ def main():
 
     embedder = FaceEmbedder()
     tracker = IoUTracker()
+    pose_model = YOLO("yolov8n-pose.pt")
     aggregators = {}   # student_id -> StudentAggregator
 
     now = datetime.now()
@@ -232,6 +284,9 @@ def main():
         except Exception as exc:
             print(f"  [WARN] API update failed: {exc}")
 
+    frame_i = 0
+    last_body_kps, last_body_boxes = [], []
+
     try:
         while True:
             ok, frame = cap.read()
@@ -241,6 +296,7 @@ def main():
 
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
+            frame_i += 1
             elapsed = int(time.time() - start_ts)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             result = face_mesh.process(rgb)
@@ -249,7 +305,16 @@ def main():
             bboxes = [_face_bbox(lm_obj.landmark, w, h) for lm_obj in landmark_sets]
             tracks = tracker.update(bboxes)
 
-            for track, lm_obj in zip(tracks, landmark_sets):
+            if frame_i % BODY_EVERY_N_FRAMES == 0:
+                pose_result = pose_model(frame, verbose=False)[0]
+                if pose_result.keypoints is not None and len(pose_result.keypoints.data):
+                    last_body_kps = pose_result.keypoints.data.cpu().numpy()
+                    last_body_boxes = [tuple(b) for b in pose_result.boxes.xyxy.cpu().numpy().astype(int)]
+                else:
+                    last_body_kps, last_body_boxes = [], []
+            body_matches = _match_tracks_to_bodies(tracks, last_body_boxes)
+
+            for ti, (track, lm_obj) in enumerate(zip(tracks, landmark_sets)):
                 lm = lm_obj.landmark
 
                 if track.frames_since_recognition >= RECOGNITION_INTERVAL:
@@ -263,17 +328,31 @@ def main():
                 ear_avg = (_ear(lm, _LEFT_EYE, w, h) + _ear(lm, _RIGHT_EYE, w, h)) / 2.0
                 mar_val = _mar(lm, w, h)
                 pitch, yaw = _head_pose(lm, w, h)
-                pose, expr, score = classify(pitch, yaw, ear_avg, mar_val)
-                level = score_to_level(score)
+                pose, expr, face_score = classify(pitch, yaw, ear_avg, mar_val)
+
+                # Body cues (Phase 3): only if this track matched a YOLO person box this frame.
+                posture = None
+                final_score = face_score
+                if ti in body_matches:
+                    kps = last_body_kps[body_matches[ti]]
+                    posture, body_score, shoulder_w = classify_body(kps, track.body_baseline)
+                    if shoulder_w and posture == "neutral":
+                        track.body_baseline = shoulder_w if track.body_baseline is None else (0.9 * track.body_baseline + 0.1 * shoulder_w)
+                    track.body_posture, track.body_score = posture, body_score
+                    final_score = combine_scores(face_score, body_score, FACE_WEIGHT)
+
+                level = score_to_level(final_score)
 
                 if track.student_id:
                     agg = aggregators.get(track.student_id)
                     if agg is None:
                         agg = StudentAggregator(track.student_id, track.student_name)
                         aggregators[track.student_id] = agg
-                    agg.record(elapsed, score, pose, expr, ear_avg, mar_val)
+                    agg.record(elapsed, final_score, pose, expr, ear_avg, mar_val, posture)
                     col = _LEVEL_COLOUR.get(level, _COL_WHITE)
-                    label = f"{track.student_name}  {int(score*100)}%"
+                    label = f"{track.student_name}  {int(final_score*100)}%"
+                    if posture:
+                        label += f"  [{posture}]"
                 else:
                     col = _COL_GRAY
                     label = "Unknown"

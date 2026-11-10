@@ -42,6 +42,12 @@ class Track:
     student_name: Optional[str] = None
     frames_since_recognition: int = 999   # force recognition on first sighting
     score_history: list = field(default_factory=list)
+    # Body-language cache (Phase 3) -- same caller-managed-field pattern as
+    # the identity fields above. body_baseline is this track's own resting
+    # shoulder width, used by body_cues.classify_body() to detect leaning.
+    body_posture: Optional[str] = None
+    body_score: float = 0.55
+    body_baseline: Optional[float] = None
 
 
 class IoUTracker:
