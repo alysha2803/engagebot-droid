@@ -2,3 +2,6 @@
 .venv_check/
 __pycache__/
 *.pyc
+
+# Downloaded model weights (13MB) -- see models/README.md for the fetch command
+models/*.onnx
