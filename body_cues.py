@@ -89,11 +89,3 @@ def classify_body(keypoints, shoulder_width_baseline=None):
             return "slouched", _BODY_MATRIX["slouched"], shoulder_width
 
     return "neutral", _BODY_MATRIX["neutral"], shoulder_width
-
-
-def combine_scores(face_score, body_score, face_weight=0.6):
-    """Weighted blend of the existing face-cue score (droid.py's classify())
-    and this body-cue score. Face stays primary -- it's the better-validated
-    signal -- body is a supporting cue, matching the slides' framing of
-    facial expression + body language + noise as combined inputs."""
-    return face_weight * face_score + (1 - face_weight) * body_score

@@ -1,8 +1,9 @@
 """
-Phase 2 + 3: the real droid loop -- multi-face detection + tracking +
-recognition + face cues + body-language cues + per-student engagement
-scoring, writing one SessionReport covering the WHOLE class (not a single
-pre-selected student like droid.py's prototype).
+Phase 2 + 3 + 4 + 5: the real droid loop -- multi-face detection + tracking +
+recognition + face cues + body-language cues + noise monitoring + fused
+per-student and whole-class engagement scoring, writing one SessionReport
+covering the WHOLE class (not a single pre-selected student like droid.py's
+prototype).
 
 Pipeline per frame:
     MediaPipe (detect all faces + landmarks)
@@ -14,12 +15,18 @@ Pipeline per frame:
     YOLOv8-Pose (detect all person boxes + keypoints)
         -> matched to the same face tracks by bbox containment
         -> classify_body() from body_cues.py (posture -> body score)
-    combine_scores() blends face + body into the final per-frame score.
+    fuse_student_score() from fusion.py blends face + body into the final
+    per-frame score (see fusion.py for why it's a weighted blend, not a
+    trained model). class_engagement_summary() then turns everyone's
+    session-average score into the whole-class picture (a breakdown by
+    level, not just a single hiding-the-bimodal-case average).
+    NoiseMonitor runs independently (class-level signal, not blended --
+    see audio_cues.py for why).
 
 Each recognized student's scores are accumulated independently and flushed
 to the backend periodically as studentEngagements[], same report shape
-droid.py already produces (just with N students instead of 1, and a new
-postureDistribution field alongside poseDistribution/expressionDistribution).
+droid.py already produces (just with N students instead of 1, a new
+postureDistribution field, and a class-level noiseDistribution).
 
 Usage:
     python classroom_session.py
@@ -46,8 +53,9 @@ from droid import (
 from face_embedding import FaceEmbedder, five_points_from_mediapipe
 from face_recognizer import FaceRecognizer
 from tracker import IoUTracker
-from body_cues import classify_body, combine_scores
+from body_cues import classify_body
 from audio_cues import NoiseMonitor
+from fusion import fuse_student_score, class_engagement_summary
 
 API_BASE               = os.getenv("API_BASE", "http://localhost:5000/api")
 CAMERA_SOURCE           = os.getenv("CAMERA_SOURCE", DEFAULT_CAMERA_SOURCE)
@@ -271,10 +279,11 @@ def main():
         if not aggregators and not final:
             return
         engagements = [agg.to_engagement_dict() for agg in aggregators.values()]
-        class_avg = (sum(a.avg_score() for a in aggregators.values()) / len(aggregators)) if aggregators else 0.0
+        summary = class_engagement_summary([a.avg_score() for a in aggregators.values()])
         patch = {
-            "avgFocusScore": int(class_avg * 100),
-            "overallEngagement": score_to_level(class_avg),
+            "avgFocusScore": summary["avgScore"],
+            "overallEngagement": summary["level"],
+            "engagementBreakdown": summary["breakdown"],
             "studentEngagements": engagements,
             "noiseDistribution": noise_monitor.distribution(),
         }
@@ -284,7 +293,7 @@ def main():
         try:
             api.update_report(report_id, patch)
             tag = "FINAL" if final else "UPDATE"
-            print(f"  [{tag}]  {len(engagements)} student(s)  class_avg={int(class_avg*100)}%")
+            print(f"  [{tag}]  {len(engagements)} student(s)  class_avg={summary['avgScore']}%  breakdown={summary['breakdown']}")
         except Exception as exc:
             print(f"  [WARN] API update failed: {exc}")
 
@@ -343,7 +352,7 @@ def main():
                     if shoulder_w and posture == "neutral":
                         track.body_baseline = shoulder_w if track.body_baseline is None else (0.9 * track.body_baseline + 0.1 * shoulder_w)
                     track.body_posture, track.body_score = posture, body_score
-                    final_score = combine_scores(face_score, body_score, FACE_WEIGHT)
+                    final_score = fuse_student_score(face_score, body_score, FACE_WEIGHT)
 
                 level = score_to_level(final_score)
 
