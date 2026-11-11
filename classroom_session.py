@@ -1,5 +1,5 @@
 """
-Phase 2 + 3 + 4 + 5: the real droid loop -- multi-face detection + tracking +
+Phase 2 + 3 + 4 + 5 + 6: the real droid loop -- multi-face detection + tracking +
 recognition + face cues + body-language cues + noise monitoring + fused
 per-student and whole-class engagement scoring, writing one SessionReport
 covering the WHOLE class (not a single pre-selected student like droid.py's
@@ -21,7 +21,9 @@ Pipeline per frame:
     session-average score into the whole-class picture (a breakdown by
     level, not just a single hiding-the-bimodal-case average).
     NoiseMonitor runs independently (class-level signal, not blended --
-    see audio_cues.py for why).
+    see audio_cues.py for why). LEDClient pushes the whole-class level to
+    the Pi's LED every LED_UPDATE_INTERVAL seconds (see led_controller.py --
+    no hardware wired up yet, so this degrades gracefully if unreachable).
 
 Each recognized student's scores are accumulated independently and flushed
 to the backend periodically as studentEngagements[], same report shape
@@ -56,6 +58,7 @@ from tracker import IoUTracker
 from body_cues import classify_body
 from audio_cues import NoiseMonitor
 from fusion import fuse_student_score, class_engagement_summary
+from led_controller import LEDClient
 
 API_BASE               = os.getenv("API_BASE", "http://localhost:5000/api")
 CAMERA_SOURCE           = os.getenv("CAMERA_SOURCE", DEFAULT_CAMERA_SOURCE)
@@ -66,6 +69,7 @@ RECOGNITION_INTERVAL    = int(os.getenv("RECOGNITION_INTERVAL_FRAMES", "10"))
 BODY_EVERY_N_FRAMES     = int(os.getenv("BODY_PROCESS_EVERY_N_FRAMES", "1"))
 FACE_WEIGHT             = float(os.getenv("FACE_WEIGHT", "0.6"))   # face vs body blend
 POST_INTERVAL           = 30     # seconds between live API updates
+LED_UPDATE_INTERVAL     = 5      # seconds between LED colour updates (faster than the report flush -- it's a live ambient indicator)
 TIMELINE_INTERVAL       = 5      # seconds between timeline sample points
 DROID_ID                = "classroom-prototype"
 DISTRACTED_CUTOFF       = 0.35
@@ -244,6 +248,7 @@ def main():
     pose_model = YOLO("yolov8n-pose.pt")
     noise_monitor = NoiseMonitor()
     noise_monitor.start()
+    led_client = LEDClient()
     aggregators = {}   # student_id -> StudentAggregator
 
     now = datetime.now()
@@ -299,6 +304,7 @@ def main():
 
     frame_i = 0
     last_body_kps, last_body_boxes = [], []
+    last_led_update = 0.0
 
     try:
         while True:
@@ -376,6 +382,9 @@ def main():
                 cv2.putText(frame, label, (x0 + 2, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
             class_avg_now = (sum(a.avg_score() for a in aggregators.values()) / len(aggregators)) if aggregators else 0.0
+            if time.time() - last_led_update >= LED_UPDATE_INTERVAL:
+                led_client.set_level(score_to_level(class_avg_now) if aggregators else "absent")
+                last_led_update = time.time()
             header = f"Students seen: {len(aggregators)}   class avg: {int(class_avg_now*100)}%   noise: {noise_monitor.current_level()}"
             cv2.rectangle(frame, (0, 0), (w, 28), _COL_DARK, -1)
             cv2.putText(frame, header, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COL_WHITE, 1)
@@ -392,6 +401,8 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         noise_monitor.stop()
+        led_client.set_level("absent")
+        led_client.close()
         print("\n  Stopping session …")
         flush(final=True)
         api.close()
