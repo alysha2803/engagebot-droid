@@ -47,6 +47,7 @@ from face_embedding import FaceEmbedder, five_points_from_mediapipe
 from face_recognizer import FaceRecognizer
 from tracker import IoUTracker
 from body_cues import classify_body, combine_scores
+from audio_cues import NoiseMonitor
 
 API_BASE               = os.getenv("API_BASE", "http://localhost:5000/api")
 CAMERA_SOURCE           = os.getenv("CAMERA_SOURCE", DEFAULT_CAMERA_SOURCE)
@@ -233,6 +234,8 @@ def main():
     embedder = FaceEmbedder()
     tracker = IoUTracker()
     pose_model = YOLO("yolov8n-pose.pt")
+    noise_monitor = NoiseMonitor()
+    noise_monitor.start()
     aggregators = {}   # student_id -> StudentAggregator
 
     now = datetime.now()
@@ -273,6 +276,7 @@ def main():
             "avgFocusScore": int(class_avg * 100),
             "overallEngagement": score_to_level(class_avg),
             "studentEngagements": engagements,
+            "noiseDistribution": noise_monitor.distribution(),
         }
         if final:
             patch["status"] = "completed"
@@ -363,7 +367,7 @@ def main():
                 cv2.putText(frame, label, (x0 + 2, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
             class_avg_now = (sum(a.avg_score() for a in aggregators.values()) / len(aggregators)) if aggregators else 0.0
-            header = f"Students seen: {len(aggregators)}   class avg: {int(class_avg_now*100)}%"
+            header = f"Students seen: {len(aggregators)}   class avg: {int(class_avg_now*100)}%   noise: {noise_monitor.current_level()}"
             cv2.rectangle(frame, (0, 0), (w, 28), _COL_DARK, -1)
             cv2.putText(frame, header, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COL_WHITE, 1)
 
@@ -378,6 +382,7 @@ def main():
         face_mesh.close()
         cap.release()
         cv2.destroyAllWindows()
+        noise_monitor.stop()
         print("\n  Stopping session …")
         flush(final=True)
         api.close()
