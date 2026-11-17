@@ -1,0 +1,20 @@
+# Copy this file to ~/.config/autostart/droid-kiosk.desktop on the Pi
+# (create the autostart folder first if it doesn't exist:
+#   mkdir -p ~/.config/autostart
+# ).
+#
+# Auto-launches Chromium in kiosk mode pointed at the local droid display,
+# once the Pi boots to the desktop (requires Desktop Autologin to be
+# enabled via `sudo raspi-config` -> System Options -> Boot / Auto Login
+# -> Desktop Autologin, so no one has to log in by hand).
+#
+# The `sleep 8` gives droid-stream.service a few seconds to finish
+# starting before Chromium tries to load the page -- without it, the very
+# first boot after a power cycle can show a connection error before the
+# kiosk page's own retry logic (see kiosk.html) kicks in.
+
+[Desktop Entry]
+Type=Application
+Name=Droid Kiosk Display
+Exec=sh -c "sleep 8 && chromium-browser --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --incognito http://localhost:5001/"
+X-GNOME-Autostart-enabled=true
