@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>EngageBot Droid</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    background-color: #1E2B1A; transition: background-color 0.6s ease;
+  }
+  .idle { color: #EEF2E6; text-align: center; }
+  .idle h1 { font-size: 7vw; font-weight: 700; color: #9CAF88; margin-bottom: 2vh; }
+  .idle p { font-size: 3vw; color: #D6DEC8; display: flex; align-items: center; justify-content: center; gap: 1vw; }
+  .dot {
+    width: 2vw; height: 2vw; border-radius: 50%; background: #9CAF88;
+    display: inline-block; animation: pulse 1.6s infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .live { color: white; text-align: center; font-weight: 800; }
+  .live .level { font-size: 11vw; text-transform: uppercase; letter-spacing: 0.05em; }
+  .live .sub { font-size: 3vw; opacity: 0.85; margin-top: 1vh; font-weight: 500; }
+  .offline { color: #D6DEC8; text-align: center; font-size: 2.5vw; }
+</style>
+</head>
+<body id="body">
+  <div id="content" class="idle">
+    <h1>EngageBot</h1>
+    <p><span class="dot"></span>Ready &mdash; waiting for class to start</p>
+  </div>
+
+<script>
+const body = document.getElementById('body');
+const content = document.getElementById('content');
+
+function showIdle() {
+  body.style.backgroundColor = '#1E2B1A';
+  content.className = 'idle';
+  content.innerHTML = '<h1>EngageBot</h1><p><span class="dot"></span>Ready &mdash; waiting for class to start</p>';
+}
+
+function showLive(s) {
+  const r = Math.round((s.r || 0) * 255);
+  const g = Math.round((s.g || 0) * 255);
+  const b = Math.round((s.b || 0) * 255);
+  body.style.backgroundColor = `rgb(${r},${g},${b})`;
+  content.className = 'live';
+  if (s.level) {
+    content.innerHTML = `<div class="level">${s.level}</div><div class="sub">Class Engagement</div>`;
+  } else {
+    // Session just started -- no student recognized yet.
+    content.innerHTML = `<div class="sub" style="font-size:4vw;">Session started&hellip;<br>Identifying students</div>`;
+  }
+}
+
+let misses = 0;
+
+async function poll() {
+  try {
+    const res = await fetch('/kiosk/state', { cache: 'no-store' });
+    const s = await res.json();
+    misses = 0;
+    if (s.state === 'live') showLive(s); else showIdle();
+  } catch (e) {
+    // Server not reachable yet (e.g. right at boot) -- keep showing the
+    // last known state for a few misses, then say so plainly rather than
+    // freeze silently on a stale screen during a demo.
+    misses++;
+    if (misses >= 5) {
+      body.style.backgroundColor = '#1E2B1A';
+      content.className = 'offline';
+      content.innerHTML = 'Connecting to droid server&hellip;';
+    }
+  }
+  setTimeout(poll, 1000);
+}
+
+poll();
+</script>
+</body>
+</html>
