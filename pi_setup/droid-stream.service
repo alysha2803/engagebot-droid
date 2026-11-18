@@ -1,0 +1,25 @@
+# Copy this file to /etc/systemd/system/droid-stream.service on the Pi,
+# then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable droid-stream.service
+#   sudo systemctl start droid-stream.service
+#
+# Auto-starts pi_stream_server.py (video + audio + kiosk endpoints) on
+# every boot, with no keyboard/monitor/SSH needed, and restarts it if it
+# ever crashes. Adjust User= and WorkingDirectory= if your username or the
+# file location on the Pi differs from the defaults below.
+
+[Unit]
+Description=EngageBot droid stream server (video + audio + kiosk)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/engagebot-droid
+ExecStart=/usr/bin/python3 /home/pi/engagebot-droid/pi_stream_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

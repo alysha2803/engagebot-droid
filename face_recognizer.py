@@ -27,32 +27,63 @@ class Match:
 
 
 class FaceRecognizer:
-    def __init__(self, enrolled):
+    def __init__(self, enrolled, pending=None):
         """`enrolled` is the API response from
         GET /students/class/:classGroup/face-embeddings:
         [{id, name, embeddings: [[float, ...], ...]}, ...]
+
+        `pending` is the equivalent for not-yet-named auto-enrolled faces
+        (GET /pending-faces/class/:classGroup/embeddings) -- matched against
+        on equal footing with real students, so a face already auto-enrolled
+        earlier this class gets recognized as "itself" instead of spawning a
+        duplicate pending identity every time it's seen.
         """
-        self._enrolled = [
-            e for e in enrolled if e.get("embeddings")
-        ]
+        self._gallery = {}   # id -> {"name", "embeddings", "kind"}
+        for e in enrolled:
+            if e.get("embeddings"):
+                self._gallery[e["id"]] = {"name": e["name"], "embeddings": e["embeddings"], "kind": "student"}
+        for e in (pending or []):
+            if e.get("embeddings"):
+                self._gallery[e["id"]] = {"name": e["name"], "embeddings": e["embeddings"], "kind": "pending"}
 
     def is_empty(self):
-        return len(self._enrolled) == 0
+        return len(self._gallery) == 0
+
+    def add_candidate(self, candidate_id, name, embeddings, kind="pending"):
+        """Registers a newly auto-enrolled face so later frames in the same
+        session can match against it immediately, without re-fetching the
+        whole gallery from the backend."""
+        self._gallery[candidate_id] = {"name": name, "embeddings": list(embeddings), "kind": kind}
+
+    def update_candidate_embeddings(self, candidate_id, embeddings):
+        """Keeps the in-memory gallery in sync after a growth PATCH."""
+        if candidate_id in self._gallery:
+            self._gallery[candidate_id]["embeddings"] = list(embeddings)
+
+    def append_embedding(self, candidate_id, embedding):
+        """Appends one more embedding locally, mirroring a successful growth
+        PATCH on the backend without needing a full gallery re-fetch."""
+        if candidate_id in self._gallery:
+            self._gallery[candidate_id]["embeddings"].append(embedding)
+
+    def kind_of(self, candidate_id):
+        entry = self._gallery.get(candidate_id)
+        return entry["kind"] if entry else None
 
     def recognize(self, probe_embedding) -> Optional[Match]:
         """Returns the best Match if confident, else None (unrecognized)."""
         scored = []
-        for student in self._enrolled:
-            best_for_student = max(
-                cosine_similarity(probe_embedding, ref) for ref in student["embeddings"]
+        for candidate_id, entry in self._gallery.items():
+            best_for_candidate = max(
+                cosine_similarity(probe_embedding, ref) for ref in entry["embeddings"]
             )
-            scored.append((best_for_student, student))
+            scored.append((best_for_candidate, candidate_id, entry))
 
         if not scored:
             return None
 
         scored.sort(key=lambda t: t[0], reverse=True)
-        top_score, top_student = scored[0]
+        top_score, top_id, top_entry = scored[0]
         runner_up_score = scored[1][0] if len(scored) > 1 else 0.0
         margin = top_score - runner_up_score
 
@@ -60,8 +91,8 @@ class FaceRecognizer:
             return None
 
         return Match(
-            student_id=top_student["id"],
-            name=top_student["name"],
+            student_id=top_id,
+            name=top_entry["name"],
             score=top_score,
             margin=margin,
         )

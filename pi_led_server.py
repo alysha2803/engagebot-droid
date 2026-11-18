@@ -2,6 +2,14 @@
 Phase 6: runs ON THE PI once the LED hardware is wired up (not run on the
 laptop -- deploy this file to the Pi the same way pi_stream_server.py was).
 
+NOT currently wired into the active pipeline -- led_controller.py now
+targets pi_stream_server.py's /kiosk endpoint (a touchscreen display) as a
+temporary stand-in since the real LED strip isn't bought yet. Once it is,
+either point led_controller.py's KIOSK_SERVER_URL/LEVEL_TO_COLOR usage at
+this file's /led endpoint instead (it listens on a different port, 5002,
+so both can run side by side during the transition), or fold this route
+into pi_stream_server.py directly, same way audio got folded in.
+
 Receives a colour from led_controller.py (laptop side) and sets a single
 RGB LED via gpiozero. Assumes the simplest common setup: one RGB LED (3
 legs + common ground) on 3 GPIO pins, driven via PWM for colour mixing --

@@ -42,6 +42,22 @@ class Track:
     student_name: Optional[str] = None
     frames_since_recognition: int = 999   # force recognition on first sighting
     score_history: list = field(default_factory=list)
+    # Majority-vote identity cache: a single bad-angle frame no longer flips
+    # or erases an identity built from several confident recognition attempts.
+    # votes: candidate_id -> vote count. vote_names: candidate_id -> display name.
+    votes: dict = field(default_factory=dict)
+    vote_names: dict = field(default_factory=dict)
+    last_growth_ts: float = 0.0   # throttles continual-enrollment growth POSTs
+
+    def register_vote(self, candidate_id, name):
+        """Adds one vote for `candidate_id` and updates student_id/student_name
+        to whichever candidate currently has the most votes -- the track's
+        displayed identity is a running majority, not just the latest guess."""
+        self.votes[candidate_id] = self.votes.get(candidate_id, 0) + 1
+        self.vote_names[candidate_id] = name
+        best_id = max(self.votes, key=self.votes.get)
+        self.student_id = best_id
+        self.student_name = self.vote_names[best_id]
     # Body-language cache (Phase 3) -- same caller-managed-field pattern as
     # the identity fields above. body_baseline is this track's own resting
     # shoulder width, used by body_cues.classify_body() to detect leaning.

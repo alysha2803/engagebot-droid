@@ -4,14 +4,24 @@ Phase 2: enroll a student's face so the droid can recognize them later.
 Captures a few reference photos (webcam or existing image files), embeds each
 via ArcFace, and POSTs the vectors to the backend
 (POST /api/students/:id/face-embeddings). Multiple photos per student improve
-match robustness across angle/lighting -- aim for 3-5.
+match robustness across angle/lighting -- aim for 3-5 where real photos are
+available.
+
+Where only ONE official passport-style photo is available per student (e.g.
+privacy policy for underage students -- no collecting multiple candid
+photos), use --augment instead: generates synthetic variants from that one
+photo (see enrollment_augment.py for why this is standard practice for the
+"Single Sample Per Person" problem, not a workaround) rather than requiring
+more real photos of the student.
 
 Usage:
-    python enroll_student.py                      # webcam capture, SPACE to snap, ESC when done
-    python enroll_student.py photo1.jpg photo2.jpg # enroll from existing image files instead
+    python enroll_student.py                              # webcam capture, SPACE to snap, ESC when done
+    python enroll_student.py photo1.jpg photo2.jpg         # enroll from existing image files instead
+    python enroll_student.py passport.jpg --augment 10     # one photo -> 10 synthetic variants + the original
 
 Shares login/API config with droid.py (same .env).
 """
+import argparse
 import os
 import sys
 
@@ -24,6 +34,7 @@ load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from face_embedding import FaceEmbedder, five_points_from_mediapipe
+from enrollment_augment import augment_aligned_face, augmentation_names
 
 API_BASE         = os.getenv("API_BASE", "http://localhost:5000/api")
 CAMERA_SOURCE    = os.getenv("CAMERA_SOURCE", "0")
@@ -123,7 +134,7 @@ def largest_face_points(face_mesh, img):
     return five_points_from_mediapipe(best_lm, w, h)
 
 
-def capture_from_files(paths, face_mesh, embedder):
+def capture_from_files(paths, face_mesh, embedder, augment=0):
     embeddings = []
     for path in paths:
         img = cv2.imread(path)
@@ -134,12 +145,19 @@ def capture_from_files(paths, face_mesh, embedder):
         if pts is None:
             print(f"  SKIP (no face detected): {path}")
             continue
-        emb = embedder.embed_from_frame(img, pts)
-        if emb is None:
+        aligned = embedder.align(img, pts)
+        if aligned is None:
             print(f"  SKIP (alignment failed): {path}")
             continue
-        embeddings.append(emb)
+        embeddings.append(embedder.embed(aligned))
         print(f"  OK: {path}")
+
+        if augment > 0:
+            variants = augment_aligned_face(aligned, n=augment)
+            names = augmentation_names(n=augment)
+            for name, variant in zip(names, variants):
+                embeddings.append(embedder.embed(variant))
+            print(f"  +{len(variants)} synthetic variant(s): {', '.join(names)}")
     return embeddings
 
 
@@ -184,16 +202,22 @@ def capture_from_webcam(face_mesh, embedder):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("images", nargs="*", help="Existing photo file(s); omit to use the webcam instead")
+    parser.add_argument("--augment", type=int, default=0,
+                         help="Generate this many synthetic variants per photo (for single-passport-photo enrollment)")
+    args = parser.parse_args()
+
     api = EnrollAPI()
     student_id, student_name = pick_student(api)
 
     face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, max_num_faces=5, refine_landmarks=True)
     embedder = FaceEmbedder()
 
-    image_paths = sys.argv[1:]
-    if image_paths:
-        print(f"\nEnrolling {student_name} from {len(image_paths)} file(s)...")
-        embeddings = capture_from_files(image_paths, face_mesh, embedder)
+    if args.images:
+        print(f"\nEnrolling {student_name} from {len(args.images)} file(s)"
+              f"{f' with {args.augment} augmented variant(s) each' if args.augment else ''}...")
+        embeddings = capture_from_files(args.images, face_mesh, embedder, augment=args.augment)
     else:
         print(f"\nEnrolling {student_name} via webcam...")
         embeddings = capture_from_webcam(face_mesh, embedder)

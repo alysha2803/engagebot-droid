@@ -1,5 +1,5 @@
 """
-Phase 2 + 3 + 4 + 5 + 6: the real droid loop -- multi-face detection + tracking +
+Phase 2 + 3 + 4 + 5 + 6 + open-set recognition: the real droid loop -- multi-face detection + tracking +
 recognition + face cues + body-language cues + noise monitoring + fused
 per-student and whole-class engagement scoring, writing one SessionReport
 covering the WHOLE class (not a single pre-selected student like droid.py's
@@ -9,8 +9,19 @@ Pipeline per frame:
     MediaPipe (detect all faces + landmarks)
         -> IoUTracker (persist an identity across frames without
            re-running recognition every single frame)
-        -> FaceRecognizer, re-checked every RECOGNITION_INTERVAL_FRAMES
-           per track (best-match against the class's enrolled students)
+        -> FaceRecognizer, re-checked every RECOGNITION_INTERVAL_FRAMES per
+           track, but only on a quality-passing face (MIN_FACE_SIZE_FOR_RECOGNITION/
+           MAX_YAW_FOR_RECOGNITION) -- matched against the class's enrolled
+           students AND any already-auto-enrolled "Unlabeled-XXXX" faces.
+           track.register_vote() accumulates a running majority across the
+           track's lifetime, so one bad-angle misread doesn't flip or erase
+           an identity several confident frames already agreed on. A
+           quality-passing face that matches NO ONE becomes a brand new
+           auto-enrolled identity (no pre-supplied photo needed); a
+           quality-passing face that matches someone with very high
+           confidence occasionally grows that identity's reference set
+           (continual enrollment, cooldown-limited) -- see
+           face_recognizer.py / enrollment_augment.py for the full reasoning.
         -> classify() from droid.py (pose/expression -> face score)
     YOLOv8-Pose (detect all person boxes + keypoints)
         -> matched to the same face tracks by bbox containment
@@ -20,10 +31,14 @@ Pipeline per frame:
     trained model). class_engagement_summary() then turns everyone's
     session-average score into the whole-class picture (a breakdown by
     level, not just a single hiding-the-bimodal-case average).
-    NoiseMonitor runs independently (class-level signal, not blended --
-    see audio_cues.py for why). LEDClient pushes the whole-class level to
-    the Pi's LED every LED_UPDATE_INTERVAL seconds (see led_controller.py --
-    no hardware wired up yet, so this degrades gracefully if unreachable).
+    NoiseMonitor streams audio from the Pi's mic (pi_stream_server.py's
+    /audio.pcm) rather than the laptop's own -- class-level signal, not
+    blended into scores, see audio_cues.py for why. LEDClient pushes the
+    whole-class level to the Pi's touchscreen kiosk display (a temporary
+    stand-in for the real LED strip, not bought yet) every
+    LED_UPDATE_INTERVAL seconds, degrading gracefully if unreachable. Both
+    the audio and display URLs are derived automatically from
+    CAMERA_SOURCE, since all three now live on one combined Pi-side server.
 
 Each recognized student's scores are accumulated independently and flushed
 to the backend periodically as studentEngagements[], same report shape
@@ -33,10 +48,12 @@ postureDistribution field, and a class-level noiseDistribution).
 Usage:
     python classroom_session.py
 """
+import base64
 import os
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 
 import cv2
 import httpx
@@ -73,6 +90,28 @@ LED_UPDATE_INTERVAL     = 5      # seconds between LED colour updates (faster th
 TIMELINE_INTERVAL       = 5      # seconds between timeline sample points
 DROID_ID                = "classroom-prototype"
 DISTRACTED_CUTOFF       = 0.35
+
+# Quality gating for identity decisions (NOT for face/body scoring, which
+# still runs on every detected face regardless) -- a tiny, extreme-angle
+# face shouldn't be trusted to confirm a match OR become a brand new
+# auto-enrolled identity. Scoring still happens on it; identity doesn't.
+MIN_FACE_SIZE_FOR_RECOGNITION = int(os.getenv("MIN_FACE_SIZE_FOR_RECOGNITION", "60"))   # px
+MAX_YAW_FOR_RECOGNITION       = float(os.getenv("MAX_YAW_FOR_RECOGNITION", "30"))        # degrees
+
+# Open-set auto-enrollment (no pre-supplied photo needed -- see
+# enrollment_augment.py's docstring for the privacy motivation). First
+# unrecognized-but-quality-passing sighting of a face becomes a new
+# "Unlabeled-XXXX" identity instead of being dropped.
+AUTO_ENROLL_ENABLED    = os.getenv("AUTO_ENROLL_ENABLED", "1") != "0"
+
+# Continual reference growth -- only add a NEW sighting to an existing
+# identity's embedding set when confidence is well above the bare minimum
+# match threshold (stricter than face_recognizer.MIN_SCORE), and only once
+# per cooldown window per track, so a long session doesn't spam the backend
+# or let one mediocre frame after another slowly drift an identity's
+# reference set in a wrong direction.
+GROWTH_MIN_SCORE        = float(os.getenv("GROWTH_MIN_SCORE", "0.75"))
+GROWTH_COOLDOWN_SECONDS = float(os.getenv("GROWTH_COOLDOWN_SECONDS", "60"))
 MIN_FACE_CONTAINMENT    = 0.5    # fraction of the face bbox that must sit inside a YOLO person box to count as a match
 
 _COL_GREEN = (50, 205, 120)
@@ -177,14 +216,84 @@ def setup(api):
 
 def fetch_recognizer(api_base, headers, class_group):
     client = httpx.Client(base_url=api_base, timeout=10, headers=headers)
-    r = client.get(f"/students/class/{class_group}/face-embeddings")
-    r.raise_for_status()
-    enrolled = r.json()
+    enrolled = client.get(f"/students/class/{class_group}/face-embeddings")
+    enrolled.raise_for_status()
+    enrolled = enrolled.json()
+    pending = client.get(f"/pending-faces/class/{class_group}/embeddings")
+    pending.raise_for_status()
+    pending = pending.json()
     client.close()
     for e in enrolled:
         e["embeddings"] = [np.array(v, dtype=np.float32) for v in e["embeddings"]]
-    print(f"  {len(enrolled)} student(s) enrolled in {class_group}.")
-    return FaceRecognizer(enrolled)
+    for e in pending:
+        e["embeddings"] = [np.array(v, dtype=np.float32) for v in e["embeddings"]]
+    print(f"  {len(enrolled)} named student(s), {len(pending)} already-unlabeled face(s) known in {class_group}.")
+    return FaceRecognizer(enrolled, pending)
+
+
+def _make_thumbnail(frame, bbox, size=96):
+    """Small JPEG for a teacher to recognize at a glance when labeling --
+    not a biometric template, just a human-review thumbnail."""
+    h, w = frame.shape[:2]
+    x0, y0, x1, y1 = bbox
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop = cv2.resize(frame[y0:y1, x0:x1], (size, size))
+    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return base64.b64encode(buf).decode("ascii") if ok else None
+
+
+def auto_enroll_face(identity_client, class_group, embedding, frame, bbox):
+    """Creates a brand new 'Unlabeled-XXXX' identity from one quality-passing
+    sighting -- no pre-supplied photo required. Returns (id, name) or
+    (None, None) if the backend call fails (session keeps running either way;
+    that face just stays unrecognized until a later, hopefully-successful attempt)."""
+    try:
+        r = identity_client.post("/pending-faces", json={
+            "classGroup": class_group,
+            "embedding": embedding.tolist(),
+            "thumbnail": _make_thumbnail(frame, bbox),
+        })
+        r.raise_for_status()
+        data = r.json()
+        return data["id"], data["name"]
+    except Exception as exc:
+        print(f"  [WARN] auto-enroll failed: {exc}")
+        return None, None
+
+
+def maybe_grow_identity(identity_client, recognizer, track, match, embedding, now):
+    """Occasionally adds a new high-confidence sighting to an already-known
+    identity's reference set (continual enrollment) -- gated well above the
+    bare match threshold and cooldown-limited per track so one so-so frame
+    after another can't slowly drift a reference set in a wrong direction."""
+    if match.score < GROWTH_MIN_SCORE or now - track.last_growth_ts < GROWTH_COOLDOWN_SECONDS:
+        return
+    track.last_growth_ts = now
+    kind = recognizer.kind_of(match.student_id)
+    path = f"/pending-faces/{match.student_id}/grow" if kind == "pending" else f"/students/{match.student_id}/face-embeddings"
+    try:
+        r = identity_client.patch(path, json={"embedding": embedding.tolist()})
+        r.raise_for_status()
+        recognizer.append_embedding(match.student_id, embedding)
+    except Exception as exc:
+        print(f"  [WARN] growth update failed: {exc}")
+
+
+def _pi_base_url(camera_source):
+    """Derives the Pi's base URL (scheme://host:port) from CAMERA_SOURCE,
+    since the video stream, audio stream, and kiosk display all now live
+    on pi_stream_server.py's single combined port. Returns None when
+    CAMERA_SOURCE is a plain device index (laptop webcam, no Pi) -- audio
+    monitoring and the kiosk display are simply disabled for that run
+    rather than silently falling back to the laptop's own mic."""
+    source = str(camera_source)
+    if not source.startswith("http"):
+        return None
+    parsed = urlparse(source)
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _face_bbox(lm, w, h, pad=0.15):
@@ -240,15 +349,21 @@ def main():
 
     recognizer = fetch_recognizer(API_BASE, dict(api._client.headers), class_group)
     if recognizer.is_empty():
-        print(f"  No one enrolled yet in {class_group} -- run enroll_student.py first.")
-        sys.exit(1)
+        print(f"  No one known yet in {class_group} -- that's fine, auto-enrollment will "
+              f"start identifying individual faces from scratch as this session runs.")
+    identity_client = httpx.Client(base_url=API_BASE, timeout=10, headers=dict(api._client.headers))
+
+    pi_base = _pi_base_url(CAMERA_SOURCE)
+    if pi_base is None:
+        print("  [INFO] CAMERA_SOURCE isn't a Pi stream URL -- noise monitoring and the "
+              "droid display are disabled for this run (laptop-webcam dev/testing mode).")
 
     embedder = FaceEmbedder()
     tracker = IoUTracker()
     pose_model = YOLO("yolov8n-pose.pt")
-    noise_monitor = NoiseMonitor()
+    noise_monitor = NoiseMonitor(f"{pi_base}/audio.pcm" if pi_base else None)
     noise_monitor.start()
-    led_client = LEDClient()
+    led_client = LEDClient(pi_base)   # None when no Pi -- LEDClient handles that itself
     aggregators = {}   # student_id -> StudentAggregator
 
     now = datetime.now()
@@ -267,6 +382,7 @@ def main():
     report_id = report["id"]
     start_ts = time.time()
     last_flush = start_ts
+    led_client.set_starting()
     print(f"  Report created (id: {report_id}). Press Q in the camera window to stop.\n")
 
     camera_source = int(CAMERA_SOURCE) if str(CAMERA_SOURCE).isdigit() else CAMERA_SOURCE
@@ -333,21 +449,38 @@ def main():
                     last_body_kps, last_body_boxes = [], []
             body_matches = _match_tracks_to_bodies(tracks, last_body_boxes)
 
+            now_ts = time.time()
             for ti, (track, lm_obj) in enumerate(zip(tracks, landmark_sets)):
                 lm = lm_obj.landmark
-
-                if track.frames_since_recognition >= RECOGNITION_INTERVAL:
-                    pts5 = five_points_from_mediapipe(lm, w, h)
-                    emb = embedder.embed_from_frame(frame, pts5)
-                    match = recognizer.recognize(emb) if emb is not None else None
-                    track.student_id = match.student_id if match else None
-                    track.student_name = match.name if match else None
-                    track.frames_since_recognition = 0
 
                 ear_avg = (_ear(lm, _LEFT_EYE, w, h) + _ear(lm, _RIGHT_EYE, w, h)) / 2.0
                 mar_val = _mar(lm, w, h)
                 pitch, yaw = _head_pose(lm, w, h)
                 pose, expr, face_score = classify(pitch, yaw, ear_avg, mar_val)
+
+                # Quality gate for IDENTITY decisions only -- scoring above
+                # still runs on every face regardless of angle/size.
+                tx0, ty0, tx1, ty1 = track.bbox
+                face_quality_ok = (
+                    min(tx1 - tx0, ty1 - ty0) >= MIN_FACE_SIZE_FOR_RECOGNITION
+                    and abs(yaw) <= MAX_YAW_FOR_RECOGNITION
+                )
+
+                if track.frames_since_recognition >= RECOGNITION_INTERVAL and face_quality_ok:
+                    pts5 = five_points_from_mediapipe(lm, w, h)
+                    emb = embedder.embed_from_frame(frame, pts5)
+                    track.frames_since_recognition = 0
+
+                    if emb is not None:
+                        match = recognizer.recognize(emb)
+                        if match:
+                            track.register_vote(match.student_id, match.name)
+                            maybe_grow_identity(identity_client, recognizer, track, match, emb, now_ts)
+                        elif AUTO_ENROLL_ENABLED:
+                            new_id, new_name = auto_enroll_face(identity_client, class_group, emb, frame, track.bbox)
+                            if new_id:
+                                recognizer.add_candidate(new_id, new_name, [emb])
+                                track.register_vote(new_id, new_name)
 
                 # Body cues (Phase 3): only if this track matched a YOLO person box this frame.
                 posture = None
@@ -382,8 +515,11 @@ def main():
                 cv2.putText(frame, label, (x0 + 2, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
             class_avg_now = (sum(a.avg_score() for a in aggregators.values()) / len(aggregators)) if aggregators else 0.0
-            if time.time() - last_led_update >= LED_UPDATE_INTERVAL:
-                led_client.set_level(score_to_level(class_avg_now) if aggregators else "absent")
+            if aggregators and time.time() - last_led_update >= LED_UPDATE_INTERVAL:
+                # Nothing to show until at least one student's recognized --
+                # leave the display on whatever it last showed rather than
+                # flipping back to "idle" mid-session over a momentary gap.
+                led_client.set_level(score_to_level(class_avg_now))
                 last_led_update = time.time()
             header = f"Students seen: {len(aggregators)}   class avg: {int(class_avg_now*100)}%   noise: {noise_monitor.current_level()}"
             cv2.rectangle(frame, (0, 0), (w, 28), _COL_DARK, -1)
@@ -401,11 +537,12 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         noise_monitor.stop()
-        led_client.set_level("absent")
+        led_client.set_idle()
         led_client.close()
         print("\n  Stopping session …")
         flush(final=True)
         api.close()
+        identity_client.close()
         print("  Done.\n")
 
 

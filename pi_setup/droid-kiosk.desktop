@@ -1,0 +1,22 @@
+# Copy this file to ~/.config/autostart/droid-kiosk.desktop on the Pi
+# (create the autostart folder first if it doesn't exist:
+#   mkdir -p ~/.config/autostart
+# ).
+#
+# Auto-launches Chromium in kiosk mode pointed at the local droid display,
+# once the Pi boots to the desktop (requires Desktop Autologin to be
+# enabled via `sudo raspi-config` -> System Options -> Boot / Auto Login
+# -> Desktop Autologin, so no one has to log in by hand).
+#
+# Instead of a blind fixed sleep, this actively polls the droid server
+# every 0.5s (up to 15s) and launches Chromium the moment it responds --
+# faster on a quick boot, still robust on a slow one. The extra Chromium
+# flags below (no-first-run, disabled background networking/component
+# updates/translate, RAM-backed disk cache) cut Chromium's own startup
+# overhead, which was the bigger part of the delay, not the wait itself.
+
+[Desktop Entry]
+Type=Application
+Name=Droid Kiosk Display
+Exec=sh -c "for i in $(seq 1 30); do curl -s http://localhost:5001/kiosk/state > /dev/null && break; sleep 0.5; done; chromium-browser --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --incognito --no-first-run --disable-translate --disable-background-networking --disable-component-update --check-for-update-interval=31536000 --disk-cache-dir=/dev/null http://localhost:5001/"
+X-GNOME-Autostart-enabled=true
